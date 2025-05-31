@@ -1,0 +1,2 @@
+yt-dlp==2024.3.10
+browser-cookie3==0.19.1 

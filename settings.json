@@ -1,0 +1,11 @@
+{
+    "download_directory": "~/Music/YouTube",
+    "audio_format": "opus",
+    "audio_quality": "best",
+    "create_directory_if_missing": true,
+    "show_progress": true,
+    "cookies": {
+        "use_browser_cookies": true,
+        "custom_cookies_file": null
+    }
+} 
