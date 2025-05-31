@@ -2,6 +2,15 @@
 
 A simple command-line tool to download YouTube videos as opus audio files.
 
+Why Opus Format?
+- Opus is a modern, open-source audio codec designed for efficient streaming and storage
+- Superior compression: Better quality at lower bitrates compared to MP3
+- Lower latency: Ideal for streaming and real-time applications
+- Wider frequency range: 8 Hz to 48 kHz (MP3 is limited to 16 Hz to 16 kHz)
+- Better handling of speech and music in a single format
+- Native format on YouTube, avoiding quality loss from transcoding
+
+
 ## Requirements
 
 1. Python 3.x
