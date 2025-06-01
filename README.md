@@ -10,6 +10,13 @@ Why Opus Format?
 - Better handling of speech and music in a single format
 - Native format on YouTube, avoiding quality loss from transcoding
 
+| Case                           | Downloads video? | Converts audio? | Renames only? |
+| ------------------------------ | ---------------- | --------------- | ------------- |
+| Audio-only stream (opus) found | ❌ No             | ❌ No            | ✅ Yes (maybe) |
+| Audio-only (non-opus) found    | ❌ No             | ✅ Yes           | ❌ No          |
+| Only video+audio available     | ✅ Yes            | ✅ Yes           | ❌ No          |
+
+
 
 ## Requirements
 
