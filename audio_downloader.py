@@ -493,105 +493,137 @@ class YouTubeAudioDownloader:
             
             # Get base options and add download-specific options
             ydl_opts = self._get_base_options(self.cookie_file)
-            ydl_opts.update({
-                'format': 'bestaudio[ext=opus]/bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
-                'outtmpl': os.path.join(self.settings['download_directory'], '%(title)s.%(ext)s'),
-                'quiet': not self.settings['show_progress'],
-                'retries': 10,  # Retry up to 10 times
-                'fragment_retries': 10,
-                'skip_unavailable_fragments': False,
-                'ignoreerrors': False
-            })
             
+            # First check available formats
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                try:
-                    print("Checking video availability...")
-                    info = ydl.extract_info(url, download=False)
-                    print(f"Video found: {info.get('title', 'Unknown title')}")
-                    
-                    # Check available formats
-                    formats = info.get('formats', [])
-                    best_format = None
-                    for f in formats:
-                        if f.get('vcodec') == 'none':  # Audio only format
-                            acodec = f.get('acodec', '').lower()
-                            if acodec == 'opus':
-                                print("Found opus audio format - perfect match!")
-                                best_format = f
-                                break
-                            elif not best_format and acodec in ['m4a', 'mp4a', 'aac']:
-                                best_format = f
-                    
-                    if best_format:
-                        if best_format.get('acodec', '').lower() == 'opus':
-                            print("Will download opus directly - no conversion needed")
-                        else:
-                            print(f"Found audio-only format ({best_format.get('acodec')}) - minimal conversion needed")
+                print("Checking video availability...")
+                info = ydl.extract_info(url, download=False)
+                print(f"Video found: {info.get('title', 'Unknown title')}")
+                
+                # Check available formats
+                formats = info.get('formats', [])
+                best_format = None
+                best_format_id = None
+                
+                for f in formats:
+                    if f.get('vcodec') == 'none':  # Audio only format
+                        acodec = f.get('acodec', '').lower()
+                        ext = f.get('ext', '').lower()
+                        # Check both codec and extension since some opus streams are in webm containers
+                        if acodec == 'opus' or ext == 'opus':
+                            print(f"Found opus audio format (format_id: {f.get('format_id')}) - perfect match!")
+                            best_format = f
+                            best_format_id = f.get('format_id')
+                            break
+                        elif not best_format and acodec in ['m4a', 'mp4a', 'aac']:
+                            best_format = f
+                            best_format_id = f.get('format_id')
+                
+                if best_format:
+                    if best_format.get('acodec', '').lower() == 'opus' or best_format.get('ext', '').lower() == 'opus':
+                        print("Will download opus directly - no conversion needed")
+                        ydl_opts.update({
+                            'format': best_format_id,
+                            'outtmpl': os.path.join(self.settings['download_directory'], '%(title)s.%(ext)s'),
+                            'quiet': not self.settings['show_progress'],
+                            'retries': 10,
+                            'fragment_retries': 10,
+                            'skip_unavailable_fragments': False,
+                            'ignoreerrors': False
+                        })
                     else:
-                        print("No audio-only format available - will extract audio from video")
-                    
-                    print("\nStarting download...")
-                    info = ydl.extract_info(url, download=True)
-                    downloaded_file = ydl.prepare_filename(info)
-                    
-                    # If the downloaded file is not already in opus format, convert it
-                    if not downloaded_file.endswith('.opus'):
-                        output_file = os.path.splitext(downloaded_file)[0] + '.opus'
-                        print(f"\nConverting to opus format...")
-                        import subprocess
+                        print(f"Found audio-only format ({best_format.get('acodec')}) - will convert to opus")
+                        ydl_opts.update({
+                            'format': best_format_id,
+                            'outtmpl': os.path.join(self.settings['download_directory'], '%(title)s.%(ext)s'),
+                            'quiet': not self.settings['show_progress'],
+                            'retries': 10,
+                            'fragment_retries': 10,
+                            'skip_unavailable_fragments': False,
+                            'ignoreerrors': False
+                        })
+                else:
+                    print("No audio-only format available - will extract audio from video")
+                    ydl_opts.update({
+                        'format': 'bestaudio/best',
+                        'outtmpl': os.path.join(self.settings['download_directory'], '%(title)s.%(ext)s'),
+                        'quiet': not self.settings['show_progress'],
+                        'retries': 10,
+                        'fragment_retries': 10,
+                        'skip_unavailable_fragments': False,
+                        'ignoreerrors': False
+                    })
+            
+            # Now download with the selected format
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                print("\nStarting download...")
+                info = ydl.extract_info(url, download=True)
+                downloaded_file = ydl.prepare_filename(info)
+                
+                # Check if we need to convert - only if it's not already opus audio
+                need_conversion = True
+                
+                # If it's a webm file, check if it contains opus audio
+                if downloaded_file.endswith('.webm'):
+                    import subprocess
+                    try:
+                        # Use ffprobe to check the audio codec
+                        result = subprocess.run([
+                            'ffprobe',
+                            '-v', 'error',
+                            '-select_streams', 'a:0',
+                            '-show_entries', 'stream=codec_name',
+                            '-of', 'default=noprint_wrappers=1:nokey=1',
+                            downloaded_file
+                        ], capture_output=True, text=True, check=True)
                         
-                        try:
-                            # Run ffmpeg with detailed error output
-                            result = subprocess.run([
-                                'ffmpeg',
-                                '-i', downloaded_file,
-                                '-c:a', 'libopus',
-                                '-b:a', '192k',
-                                '-ar', '48000',
-                                '-ac', '2',
-                                '-v', 'warning',
-                                output_file
-                            ], capture_output=True, text=True, check=True)
-                            
-                            # Remove the original file if conversion was successful
-                            os.unlink(downloaded_file)
-                            print("Conversion completed successfully!")
-                            
-                        except subprocess.CalledProcessError as e:
-                            print(f"Error during conversion: {e.stderr}")
-                            if os.path.exists(output_file):
-                                os.unlink(output_file)
-                            raise Exception("Audio conversion failed. See error details above.")
-                        except Exception as e:
-                            print(f"Unexpected error during conversion: {str(e)}")
-                            if os.path.exists(output_file):
-                                os.unlink(output_file)
-                            raise
+                        if 'opus' in result.stdout.lower():
+                            print("\nFile is already in opus format, just renaming to .opus extension")
+                            need_conversion = False
+                            # Rename the file to have .opus extension
+                            output_file = os.path.splitext(downloaded_file)[0] + '.opus'
+                            os.rename(downloaded_file, output_file)
+                    except subprocess.CalledProcessError as e:
+                        print(f"Warning: Could not check audio codec: {e.stderr}")
+                        # If we can't check, assume we need to convert
+                        need_conversion = True
+                
+                # If the downloaded file is not already in opus format and needs conversion
+                if not downloaded_file.endswith('.opus') and need_conversion:
+                    output_file = os.path.splitext(downloaded_file)[0] + '.opus'
+                    print(f"\nConverting to opus format...")
+                    import subprocess
                     
-                    print(f"\nDownload completed! File saved in: {self.settings['download_directory']}")
-                except Exception as e:
-                    if "Sign in to confirm you're not a bot" in str(e):
-                        print("\nError: YouTube is requesting verification.")
-                        print("Please try the following:")
-                        print("1. Make sure you're logged into YouTube in your browser")
-                        print("2. Try opening the video in your browser first")
-                        print("3. Wait a few minutes and try again")
-                        print("4. If using Firefox, try using Chrome or Safari instead")
-                        sys.exit(1)
-                    elif "Requested format is not available" in str(e):
-                        print("\nError: Could not find suitable audio format.")
-                        formats = self.list_formats(url, self.cookie_file)
-                        if formats:
-                            print("\nTry using a different format or video URL.")
-                        sys.exit(1)
-                    elif "HTTP Error 403: Forbidden" in str(e):
-                        print("\nError: Access forbidden by YouTube.")
-                        print("This might be due to:")
-                        print("1. Too many requests - wait a few minutes and try again")
-                        print("2. Region restrictions - try with a different video")
-                        print("3. Age-restricted content - make sure you're logged in")
-                        sys.exit(1)
-                    raise e
+                    try:
+                        # Run ffmpeg with detailed error output
+                        result = subprocess.run([
+                            'ffmpeg',
+                            '-i', downloaded_file,
+                            '-c:a', 'libopus',
+                            '-b:a', '192k',
+                            '-ar', '48000',
+                            '-ac', '2',
+                            '-v', 'warning',
+                            '-y',  # Add -y flag to automatically overwrite
+                            output_file
+                        ], capture_output=True, text=True, check=True)
+                        
+                        # Remove the original file if conversion was successful
+                        os.unlink(downloaded_file)
+                        print("Conversion completed successfully!")
+                        
+                    except subprocess.CalledProcessError as e:
+                        print(f"Error during conversion: {e.stderr}")
+                        if os.path.exists(output_file):
+                            os.unlink(output_file)
+                        raise Exception("Audio conversion failed. See error details above.")
+                    except Exception as e:
+                        print(f"Unexpected error during conversion: {str(e)}")
+                        if os.path.exists(output_file):
+                            os.unlink(output_file)
+                        raise
+                
+                print(f"\nDownload completed! File saved in: {self.settings['download_directory']}")
         except Exception as e:
             print(f"Error downloading video: {str(e)}")
             if "HTTP Error 403" in str(e):
