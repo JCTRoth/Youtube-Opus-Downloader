@@ -9,13 +9,24 @@ through browser cookies to avoid bot detection and supports various audio format
 Features:
 - Downloads audio-only when available to minimize bandwidth
 - Converts to opus format (or other formats as configured)
-- Uses browser cookies for authentication
+- Uses browser cookies for authentication (supports Chrome, Firefox, and Edge)
 - Supports format listing
 - Handles various YouTube errors gracefully
 
 Usage:
     python audio_downloader.py "https://www.youtube.com/watch?v=VIDEO_ID"
     python audio_downloader.py --list-formats "https://www.youtube.com/watch?v=VIDEO_ID"
+
+Settings (settings.json):
+    download_directory: Where to save downloaded files
+    audio_format: Target audio format (opus recommended)
+    audio_quality: Quality setting for downloads
+    create_directory_if_missing: Create download directory if it doesn't exist
+    show_progress: Show download progress
+    cookies:
+        use_browser_cookies: Whether to use browser cookies
+        custom_cookies_file: Path to custom cookie file (optional)
+        preferred_browser: Browser to get cookies from ("chrome", "firefox", or "edge")
 """
 
 import sys
@@ -68,8 +79,19 @@ class YouTubeAudioDownloader:
             if 'cookies' not in settings:
                 settings['cookies'] = {
                     'use_browser_cookies': True,
-                    'custom_cookies_file': None
+                    'custom_cookies_file': None,
+                    'preferred_browser': 'chrome'
                 }
+            elif 'preferred_browser' not in settings['cookies']:
+                settings['cookies']['preferred_browser'] = 'chrome'
+            
+            # Validate preferred_browser setting
+            valid_browsers = ['chrome', 'firefox', 'edge']
+            if settings['cookies']['preferred_browser'].lower() not in valid_browsers:
+                print(f"Warning: Invalid preferred_browser '{settings['cookies']['preferred_browser']}'. Using 'chrome'.")
+                settings['cookies']['preferred_browser'] = 'chrome'
+            else:
+                settings['cookies']['preferred_browser'] = settings['cookies']['preferred_browser'].lower()
             
             return settings
         except FileNotFoundError:
@@ -83,7 +105,8 @@ class YouTubeAudioDownloader:
     "show_progress": true,
     "cookies": {
         "use_browser_cookies": true,
-        "custom_cookies_file": null
+        "custom_cookies_file": null,
+        "preferred_browser": "chrome"
     }
 }''')
             sys.exit(1)
@@ -141,57 +164,132 @@ class YouTubeAudioDownloader:
         return options
 
     def _find_firefox_cookie_file(self) -> Optional[str]:
-        """Try to find Firefox cookie file on macOS.
+        """Find Firefox cookie file based on the operating system.
         
         Returns:
             Path to cookie file if found, None otherwise
+            
+        Supported paths:
+        - Linux: ~/.mozilla/firefox/xxxxxxxx.default-release/cookies.sqlite
+        - macOS: ~/Library/Application Support/Firefox/Profiles/xxxxxxxx.default-release/cookies.sqlite
+        - Windows: %APPDATA%/Mozilla/Firefox/Profiles/xxxxxxxx.default-release/cookies.sqlite
         """
-        firefox_profile_path = os.path.expanduser("~/Library/Application Support/Firefox/Profiles")
-        if os.path.exists(firefox_profile_path):
-            profiles = glob.glob(os.path.join(firefox_profile_path, "*.default*"))
-            if profiles:
-                cookie_file = os.path.join(profiles[0], "cookies.sqlite")
-                if os.path.exists(cookie_file):
-                    return cookie_file
+        import platform
+        
+        system = platform.system().lower()
+        
+        if system == 'linux':
+            firefox_profile_path = os.path.expanduser("~/.mozilla/firefox")
+        elif system == 'darwin':  # macOS
+            firefox_profile_path = os.path.expanduser("~/Library/Application Support/Firefox/Profiles")
+        elif system == 'windows':
+            firefox_profile_path = os.path.join(os.environ.get('APPDATA', ''), 'Mozilla', 'Firefox', 'Profiles')
+        else:
+            print(f"Warning: Unsupported operating system {system} for Firefox cookie detection")
+            return None
+            
+        if not os.path.exists(firefox_profile_path):
+            print(f"No Firefox profile directory found at: {firefox_profile_path}")
+            return None
+            
+        # Look for default profile
+        default_profiles = []
+        try:
+            for item in os.listdir(firefox_profile_path):
+                if item.endswith('.default') or item.endswith('.default-release'):
+                    profile_path = os.path.join(firefox_profile_path, item)
+                    if os.path.isdir(profile_path):
+                        default_profiles.append(profile_path)
+        except Exception as e:
+            print(f"Error reading Firefox profiles: {str(e)}")
+            return None
+            
+        if not default_profiles:
+            print("No Firefox default profile found")
+            return None
+            
+        # Use the most recently modified profile if multiple exist
+        if len(default_profiles) > 1:
+            default_profiles.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+            print(f"Multiple Firefox profiles found, using most recent: {os.path.basename(default_profiles[0])}")
+            
+        cookie_file = os.path.join(default_profiles[0], 'cookies.sqlite')
+        if os.path.exists(cookie_file):
+            print(f"Found Firefox cookies at: {cookie_file}")
+            return cookie_file
+            
+        print(f"No cookies.sqlite found in Firefox profile: {default_profiles[0]}")
         return None
 
-    def _save_cookies_to_file(self, cookies: Any) -> Optional[str]:
-        """Save browser cookies to a temporary file in Netscape format.
+    def _convert_firefox_cookies_to_netscape(self, sqlite_file: str) -> Optional[str]:
+        """Convert Firefox's SQLite cookie file to Netscape format.
         
         Args:
-            cookies: Cookie object from browser_cookie3
+            sqlite_file: Path to Firefox's cookies.sqlite file
             
         Returns:
-            Path to temporary cookie file if successful, None otherwise
+            Path to temporary Netscape format cookie file if successful, None otherwise
         """
-        cookie_file = tempfile.NamedTemporaryFile(mode='w', delete=False)
         try:
-            # Write header required by Netscape format
+            import sqlite3
+            import tempfile
+            import shutil
+            
+            # Create a temporary copy of the SQLite file since it might be locked by Firefox
+            temp_sqlite = tempfile.NamedTemporaryFile(delete=False, suffix='.sqlite')
+            shutil.copy2(sqlite_file, temp_sqlite.name)
+            
+            # Create a temporary file for the Netscape format cookies
+            cookie_file = tempfile.NamedTemporaryFile(mode='w', delete=False)
+            
+            # Write Netscape format header
             cookie_file.write("# Netscape HTTP Cookie File\n")
             cookie_file.write("# https://curl.haxx.se/rfc/cookie_spec.html\n")
             cookie_file.write("# This is a generated file!  Do not edit.\n\n")
             
-            # Convert browser_cookie3 cookies to Netscape format
-            current_time = int(time.time())
-            for cookie in cookies:
-                # Handle missing expiration by setting it to 1 year from now
-                expires = cookie.expires if cookie.expires else current_time + 31536000
-                
-                # Ensure all fields are properly formatted
-                domain = cookie.domain if cookie.domain.startswith('.') else '.' + cookie.domain
-                path = cookie.path if cookie.path else '/'
-                secure = 'TRUE' if cookie.secure else 'FALSE'
-                
-                cookie_file.write(f"{domain}\tTRUE\t{path}\t{secure}\t{expires}\t{cookie.name}\t{cookie.value}\n")
+            # Connect to the copy of the SQLite database
+            conn = sqlite3.connect(temp_sqlite.name)
+            cursor = conn.cursor()
             
+            # Query to get cookies in Netscape format
+            cursor.execute("""
+                SELECT host, 
+                       CASE 
+                           WHEN host LIKE '.%' THEN 'TRUE'
+                           ELSE 'FALSE'
+                       END,
+                       path,
+                       isSecure,
+                       expiry,
+                       name,
+                       value
+                FROM moz_cookies
+                WHERE host LIKE '%youtube.com'
+            """)
+            
+            # Write each cookie in Netscape format
+            for row in cursor.fetchall():
+                host, is_domain, path, is_secure, expiry, name, value = row
+                secure = "TRUE" if is_secure else "FALSE"
+                
+                # Ensure the host starts with a dot for domain cookies
+                if is_domain == 'TRUE' and not host.startswith('.'):
+                    host = '.' + host
+                
+                cookie_line = f"{host}\t{is_domain}\t{path}\t{secure}\t{expiry}\t{name}\t{value}\n"
+                cookie_file.write(cookie_line)
+            
+            cursor.close()
+            conn.close()
             cookie_file.close()
+            
+            # Clean up the temporary SQLite file
+            os.unlink(temp_sqlite.name)
+            
             return cookie_file.name
+            
         except Exception as e:
-            print(f"Error saving cookies: {str(e)}")
-            try:
-                os.unlink(cookie_file.name)
-            except:
-                pass
+            print(f"Error converting Firefox cookies: {str(e)}")
             return None
 
     def _get_browser_cookies(self) -> Optional[str]:
@@ -204,23 +302,63 @@ class YouTubeAudioDownloader:
         
         print("\nAttempting to load cookies from browsers...")
         
+        # Define browser order based on preferred browser
+        preferred = self.settings['cookies']['preferred_browser']
+        print(f"Preferred browser: {preferred}")
+        
+        # Special handling for Firefox - try to find the cookie file directly first
+        if preferred == 'firefox':
+            print("Attempting to find Firefox cookie file directly...")
+            firefox_cookie_file = self._find_firefox_cookie_file()
+            if firefox_cookie_file:
+                print("Converting Firefox cookies to Netscape format...")
+                netscape_cookie_file = self._convert_firefox_cookies_to_netscape(firefox_cookie_file)
+                if netscape_cookie_file:
+                    print(f"Successfully converted Firefox cookies")
+                    return netscape_cookie_file
+                print("Failed to convert Firefox cookies, falling back to browser_cookie3...")
+            else:
+                print("Could not find Firefox cookie file directly, falling back to browser_cookie3...")
+        
         browsers = {
-            'Chrome': browser_cookie3.chrome,
-            'Firefox': browser_cookie3.firefox,
-            'Edge': browser_cookie3.edge
+            'chrome': browser_cookie3.chrome,
+            'firefox': browser_cookie3.firefox,
+            'edge': browser_cookie3.edge
         }
         
-        for browser_name, browser_func in browsers.items():
+        # Try preferred browser first
+        if preferred in browsers:
             try:
-                print(f"Trying to load cookies from {browser_name}...")
+                print(f"\nTrying preferred browser ({preferred})...")
+                cookies = browsers[preferred](domain_name='.youtube.com')
+                cookie_count = sum(1 for _ in cookies)
+                print(f"Found {cookie_count} cookies in {preferred}")
+                
+                if cookie_count > 0:
+                    cookie_file = self._save_cookies_to_file(cookies)
+                    if cookie_file:
+                        print(f"Successfully saved {cookie_count} cookies from {preferred}")
+                        return cookie_file
+                    print(f"Failed to save cookies from {preferred}")
+            except Exception as e:
+                if "could not find" in str(e):
+                    print(f"No {preferred} installation found")
+                else:
+                    print(f"Error accessing {preferred} cookies: {str(e)}")
+        
+        # Try other browsers if preferred browser failed
+        other_browsers = {k: v for k, v in browsers.items() if k != preferred}
+        for browser_name, browser_func in other_browsers.items():
+            try:
+                print(f"\nTrying fallback browser ({browser_name})...")
                 cookies = browser_func(domain_name='.youtube.com')
-                cookie_count = sum(1 for _ in cookies)  # Count cookies
+                cookie_count = sum(1 for _ in cookies)
                 print(f"Found {cookie_count} cookies in {browser_name}")
                 
                 if cookie_count > 0:
                     cookie_file = self._save_cookies_to_file(cookies)
                     if cookie_file:
-                        print(f"Successfully saved {cookie_count} cookies from {browser_name} to temporary file")
+                        print(f"Successfully saved {cookie_count} cookies from {browser_name}")
                         return cookie_file
                     print(f"Failed to save cookies from {browser_name}")
                 else:
@@ -228,14 +366,8 @@ class YouTubeAudioDownloader:
             except Exception as e:
                 if "could not find" in str(e):
                     print(f"No {browser_name} installation found")
-                    if browser_name == 'Firefox' and sys.platform == 'darwin':
-                        firefox_cookie = self._find_firefox_cookie_file()
-                        if firefox_cookie:
-                            print(f"Found Firefox cookies at: {firefox_cookie}")
-                            print("You can set this path in settings.json as custom_cookies_file")
                 else:
                     print(f"Error accessing {browser_name} cookies: {str(e)}")
-                continue
         
         print("\nWarning: Could not load cookies from any browser.")
         print("\nMake sure you have at least one of these browsers installed and are logged into YouTube:")
@@ -475,6 +607,45 @@ class YouTubeAudioDownloader:
                     os.unlink(self.cookie_file)
                 except:
                     pass
+
+    def _save_cookies_to_file(self, cookies: Any) -> Optional[str]:
+        """Save browser cookies to a temporary file in Netscape format.
+        
+        Args:
+            cookies: Cookie object from browser_cookie3
+            
+        Returns:
+            Path to temporary cookie file if successful, None otherwise
+        """
+        cookie_file = tempfile.NamedTemporaryFile(mode='w', delete=False)
+        try:
+            # Write header required by Netscape format
+            cookie_file.write("# Netscape HTTP Cookie File\n")
+            cookie_file.write("# https://curl.haxx.se/rfc/cookie_spec.html\n")
+            cookie_file.write("# This is a generated file!  Do not edit.\n\n")
+            
+            # Convert browser_cookie3 cookies to Netscape format
+            current_time = int(time.time())
+            for cookie in cookies:
+                # Handle missing expiration by setting it to 1 year from now
+                expires = cookie.expires if cookie.expires else current_time + 31536000
+                
+                # Ensure all fields are properly formatted
+                domain = cookie.domain if cookie.domain.startswith('.') else '.' + cookie.domain
+                path = cookie.path if cookie.path else '/'
+                secure = 'TRUE' if cookie.secure else 'FALSE'
+                
+                cookie_file.write(f"{domain}\tTRUE\t{path}\t{secure}\t{expires}\t{cookie.name}\t{cookie.value}\n")
+            
+            cookie_file.close()
+            return cookie_file.name
+        except Exception as e:
+            print(f"Error saving cookies: {str(e)}")
+            try:
+                os.unlink(cookie_file.name)
+            except:
+                pass
+            return None
 
 def main():
     """Main entry point of the script."""

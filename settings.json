@@ -6,6 +6,7 @@
     "show_progress": true,
     "cookies": {
         "use_browser_cookies": true,
-        "custom_cookies_file": null
+        "custom_cookies_file": null,
+        "preferred_browser": "firefox"
     }
 } 

@@ -1,2 +1,2 @@
-yt-dlp==2024.3.10
+yt-dlp==2025.5.22
 browser-cookie3==0.19.1 
