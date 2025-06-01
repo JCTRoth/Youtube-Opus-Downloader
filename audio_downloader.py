@@ -133,7 +133,10 @@ class YouTubeAudioDownloader:
         }
         
         if cookie_file:
+            print(f"\nUsing cookie file: {cookie_file}")
             options['cookiefile'] = cookie_file
+        else:
+            print("\nNo cookie file specified")
         
         return options
 
@@ -247,9 +250,14 @@ class YouTubeAudioDownloader:
         Returns:
             Tuple of (cookie_file_path, is_temporary_file)
         """
+        print("\nCookie configuration:")
+        print(f"- Use browser cookies: {self.settings['cookies']['use_browser_cookies']}")
+        print(f"- Custom cookies file: {self.settings['cookies']['custom_cookies_file']}")
+        
         # Check if custom cookies file is specified
         if self.settings['cookies']['custom_cookies_file']:
             cookie_path = os.path.expanduser(self.settings['cookies']['custom_cookies_file'])
+            print(f"\nChecking custom cookie file path: {cookie_path}")
             if os.path.exists(cookie_path):
                 print(f"Using custom cookies file: {cookie_path}")
                 return cookie_path, False
@@ -258,11 +266,13 @@ class YouTubeAudioDownloader:
         
         # Fall back to browser cookies if enabled
         if self.settings['cookies']['use_browser_cookies']:
-            print("Attempting to load cookies from browsers...")
+            print("\nAttempting to load cookies from browsers...")
             cookie_file = self._get_browser_cookies()
+            if cookie_file:
+                print(f"Using temporary cookie file: {cookie_file}")
             return cookie_file, bool(cookie_file and cookie_file.startswith(tempfile.gettempdir()))
         
-        print("No valid cookie source configured. Some videos might be unavailable.")
+        print("\nNo valid cookie source configured. Some videos might be unavailable.")
         return None, False
 
     def list_formats(self, url: str, cookie_file: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
