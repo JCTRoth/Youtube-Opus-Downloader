@@ -344,22 +344,7 @@ class YouTubeAudioDownloader:
             # Get base options and add download-specific options
             ydl_opts = self._get_base_options(self.cookie_file)
             ydl_opts.update({
-                # Prioritize formats in this order:
-                # 1. opus audio only (no conversion needed)
-                # 2. m4a audio only (quick conversion)
-                # 3. webm audio only
-                # 4. any other audio only
-                # 5. best format with audio if no audio-only available
                 'format': 'bestaudio[ext=opus]/bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': self.settings['audio_format'],
-                    'preferredquality': '192',
-                }],
-                'extract_audio': True,
-                'postprocessor_args': [
-                    '-ar', '44100'
-                ],
                 'outtmpl': os.path.join(self.settings['download_directory'], '%(title)s.%(ext)s'),
                 'quiet': not self.settings['show_progress'],
                 'retries': 10,  # Retry up to 10 times
@@ -395,6 +380,45 @@ class YouTubeAudioDownloader:
                     else:
                         print("No audio-only format available - will extract audio from video")
                     
+                    print("\nStarting download...")
+                    info = ydl.extract_info(url, download=True)
+                    downloaded_file = ydl.prepare_filename(info)
+                    
+                    # If the downloaded file is not already in opus format, convert it
+                    if not downloaded_file.endswith('.opus'):
+                        output_file = os.path.splitext(downloaded_file)[0] + '.opus'
+                        print(f"\nConverting to opus format...")
+                        import subprocess
+                        
+                        try:
+                            # Run ffmpeg with detailed error output
+                            result = subprocess.run([
+                                'ffmpeg',
+                                '-i', downloaded_file,
+                                '-c:a', 'libopus',
+                                '-b:a', '192k',
+                                '-ar', '48000',
+                                '-ac', '2',
+                                '-v', 'warning',
+                                output_file
+                            ], capture_output=True, text=True, check=True)
+                            
+                            # Remove the original file if conversion was successful
+                            os.unlink(downloaded_file)
+                            print("Conversion completed successfully!")
+                            
+                        except subprocess.CalledProcessError as e:
+                            print(f"Error during conversion: {e.stderr}")
+                            if os.path.exists(output_file):
+                                os.unlink(output_file)
+                            raise Exception("Audio conversion failed. See error details above.")
+                        except Exception as e:
+                            print(f"Unexpected error during conversion: {str(e)}")
+                            if os.path.exists(output_file):
+                                os.unlink(output_file)
+                            raise
+                    
+                    print(f"\nDownload completed! File saved in: {self.settings['download_directory']}")
                 except Exception as e:
                     if "Sign in to confirm you're not a bot" in str(e):
                         print("\nError: YouTube is requesting verification.")
@@ -418,10 +442,6 @@ class YouTubeAudioDownloader:
                         print("3. Age-restricted content - make sure you're logged in")
                         sys.exit(1)
                     raise e
-                
-                print("\nStarting download...")
-                ydl.download([url])
-            print(f"\nDownload completed! File saved in: {self.settings['download_directory']}")
         except Exception as e:
             print(f"Error downloading video: {str(e)}")
             if "HTTP Error 403" in str(e):
