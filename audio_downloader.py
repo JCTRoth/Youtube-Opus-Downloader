@@ -199,6 +199,8 @@ class YouTubeAudioDownloader:
         """
         import browser_cookie3
         
+        print("\nAttempting to load cookies from browsers...")
+        
         browsers = {
             'Chrome': browser_cookie3.chrome,
             'Firefox': browser_cookie3.firefox,
@@ -207,16 +209,22 @@ class YouTubeAudioDownloader:
         
         for browser_name, browser_func in browsers.items():
             try:
+                print(f"Trying to load cookies from {browser_name}...")
                 cookies = browser_func(domain_name='.youtube.com')
-                print(f"Successfully loaded cookies from {browser_name}")
-                cookie_file = self._save_cookies_to_file(cookies)
-                if cookie_file:
-                    print(f"Successfully saved cookies to temporary file")
-                    return cookie_file
-                print(f"Failed to save cookies from {browser_name}")
+                cookie_count = sum(1 for _ in cookies)  # Count cookies
+                print(f"Found {cookie_count} cookies in {browser_name}")
+                
+                if cookie_count > 0:
+                    cookie_file = self._save_cookies_to_file(cookies)
+                    if cookie_file:
+                        print(f"Successfully saved {cookie_count} cookies from {browser_name} to temporary file")
+                        return cookie_file
+                    print(f"Failed to save cookies from {browser_name}")
+                else:
+                    print(f"No YouTube cookies found in {browser_name}")
             except Exception as e:
                 if "could not find" in str(e):
-                    print(f"No {browser_name} cookies found")
+                    print(f"No {browser_name} installation found")
                     if browser_name == 'Firefox' and sys.platform == 'darwin':
                         firefox_cookie = self._find_firefox_cookie_file()
                         if firefox_cookie:
