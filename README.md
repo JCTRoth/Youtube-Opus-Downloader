@@ -3,6 +3,11 @@
 A simple command-line tool to download YouTube videos as opus audio files.
 
 Why Opus Format?
+
+tl;dr \
+Smaller files than MP3 while having the same quality. \
+In ideal case, no video download or conversion (means also no conversion loss) needed.
+
 - Opus is a modern, open-source audio codec designed for efficient streaming and storage
 - Superior compression: Better quality at lower bitrates compared to MP3
 - Lower latency: Ideal for streaming and real-time applications
