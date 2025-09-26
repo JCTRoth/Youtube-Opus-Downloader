@@ -133,6 +133,44 @@ class YouTubeAudioDownloader:
         ]
         return random.choice(user_agents)
 
+    def _get_opus_bitrate(self) -> str:
+        """Get the optimal opus bitrate, ensuring minimum of 128k.
+        
+        Returns:
+            Bitrate string for FFmpeg (e.g., '128k', '192k')
+        """
+        quality = self.settings['audio_quality']
+        
+        # Handle 'best' quality
+        if quality == 'best':
+            return '192k'  # High quality for 'best' setting
+        
+        # Handle numeric bitrate specifications
+        if isinstance(quality, str) and quality.endswith('k'):
+            try:
+                bitrate_num = int(quality[:-1])
+                # Ensure minimum of 128k for opus
+                if bitrate_num < 128:
+                    print(f"Warning: Requested bitrate {quality} is below minimum for opus. Using 128k.")
+                    return '128k'
+                return quality
+            except ValueError:
+                pass
+        
+        # Handle numeric quality without 'k' suffix
+        try:
+            bitrate_num = int(quality)
+            if bitrate_num < 128:
+                print(f"Warning: Requested bitrate {quality}k is below minimum for opus. Using 128k.")
+                return '128k'
+            return f'{bitrate_num}k'
+        except (ValueError, TypeError):
+            pass
+        
+        # Default fallback for any unrecognized quality setting
+        print(f"Warning: Unrecognized audio quality '{quality}'. Using 128k default.")
+        return '128k'
+
     def _get_base_options(self, use_fallback_cookies: bool = False) -> Dict[str, Any]:
         """Get base options for yt-dlp with modern settings.
         
@@ -514,21 +552,118 @@ class YouTubeAudioDownloader:
             # Get base options and add download-specific options
             ydl_opts = self._get_base_options()
             
-            # Configure for audio extraction
+            # Get detailed format information first (with timeout protection)
+            temp_info_opts = ydl_opts.copy()
+            temp_info_opts.update({
+                'quiet': True,
+                'no_warnings': True,
+                'extract_flat': False,  # We need full format info
+                'socket_timeout': 30,  # 30 second timeout
+            })
+            
+            # Extract format information to choose the best approach
+            best_format = None
+            
+            # Skip complex format analysis for playlists to avoid hanging
+            skip_analysis = 'list=' in url or 'playlist' in url.lower()
+            
+            if not skip_analysis:
+                print("Analyzing available formats...")
+                try:
+                    import signal
+                    
+                    def timeout_handler(signum, frame):
+                        raise TimeoutError("Format analysis timed out")
+                    
+                    # Set up timeout (30 seconds)
+                    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+                    signal.alarm(30)
+                    
+                    try:
+                        with yt_dlp.YoutubeDL(temp_info_opts) as temp_ydl:
+                            print("Extracting video information...")
+                            info = temp_ydl.extract_info(url, download=False)
+                            formats = info.get('formats', [])
+                            print(f"Found {len(formats)} total formats")
+                            
+                            # Look for the best opus format first
+                            opus_formats = [f for f in formats if f.get('acodec') == 'opus' and f.get('vcodec') == 'none']
+                            if opus_formats:
+                                # Sort by audio bitrate (higher is better)
+                                opus_formats.sort(key=lambda x: x.get('abr', 0), reverse=True)
+                                best_format = opus_formats[0]['format_id']
+                                print(f"Found direct opus format: {best_format} ({opus_formats[0].get('abr', 'unknown')}kbps)")
+                            else:
+                                # Look for high-quality webm audio that can be converted to opus
+                                webm_audio = [f for f in formats if f.get('ext') == 'webm' and f.get('vcodec') == 'none']
+                                if webm_audio:
+                                    webm_audio.sort(key=lambda x: x.get('abr', 0), reverse=True)
+                                    best_format = webm_audio[0]['format_id']
+                                    print(f"Found webm audio format for conversion: {best_format} ({webm_audio[0].get('abr', 'unknown')}kbps)")
+                                else:
+                                    # Fall back to best audio available
+                                    audio_only = [f for f in formats if f.get('vcodec') == 'none']
+                                    if audio_only:
+                                        audio_only.sort(key=lambda x: x.get('abr', 0), reverse=True)
+                                        best_format = audio_only[0]['format_id']
+                                        print(f"Using best available audio format: {best_format} ({audio_only[0].get('ext', 'unknown')} - {audio_only[0].get('abr', 'unknown')}kbps)")
+                                    else:
+                                        print("No audio-only formats found, will use fallback selection")
+                    finally:
+                        # Restore original signal handler and cancel alarm
+                        signal.alarm(0)
+                        signal.signal(signal.SIGALRM, old_handler)
+                        
+                except (TimeoutError, Exception) as e:
+                    if isinstance(e, TimeoutError):
+                        print("Format analysis timed out after 30 seconds, using fallback selection")
+                    else:
+                        print(f"Could not analyze formats, using fallback selection: {str(e)}")
+            else:
+                print("Skipping format analysis for playlist URL to avoid hanging")
+            
+            # Configure for complex audio extraction
+            if best_format:
+                # Use specific format ID for optimal quality
+                format_selector = best_format
+            else:
+                # Fallback to format string with preference for opus-compatible sources
+                format_selector = 'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best[height<=720]/best'
+            
             ydl_opts.update({
-                'format': 'bestaudio/best',
+                'format': format_selector,
                 'outtmpl': os.path.join(self.settings['download_directory'], '%(title)s.%(ext)s'),
                 'quiet': not self.settings['show_progress'],
                 'no_warnings': not self.settings['show_progress'],
-                'extractaudio': True,
-                'audioformat': self.settings['audio_format'],
-                'audioquality': self.settings['audio_quality'],
-                'prefer_ffmpeg': True,
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': self.settings['audio_format'],
-                    'preferredquality': self.settings['audio_quality'],
-                }],
+                'writeinfojson': False,  # Don't write info json
+                'writethumbnail': False,  # Don't download thumbnail
+                'writeautomaticsub': False,  # Don't download subtitles
+                'writesubtitles': False,
+                # Complex postprocessing chain for optimal opus conversion
+                'postprocessors': [
+                    {
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': self.settings['audio_format'],
+                        'preferredquality': self.settings['audio_quality'],
+                        'nopostoverwrites': False,
+                    },
+                    {
+                        'key': 'FFmpegMetadata',
+                        'add_metadata': True,
+                    },
+                ],
+                # Advanced FFmpeg options for high-quality opus encoding
+                'postprocessor_args': {
+                    'FFmpegExtractAudio': [
+                        '-acodec', 'libopus',
+                        '-b:a', self._get_opus_bitrate(),
+                        '-vbr', 'on',  # Variable bitrate for better quality
+                        '-compression_level', '10',  # Maximum compression efficiency
+                        '-application', 'audio',  # Optimize for music
+                    ],
+                },
+                # Playlist handling - only download single video by default
+                'noplaylist': True,
                 'retries': 10,
                 'fragment_retries': 10,
                 'skip_unavailable_fragments': False,
@@ -537,13 +672,51 @@ class YouTubeAudioDownloader:
                 'max_sleep_interval': 5,
             })
             
-            # Download and extract audio
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Check if this is a playlist URL
+            temp_opts = ydl_opts.copy()
+            temp_opts['noplaylist'] = False  # Temporarily allow playlist detection
+            temp_opts['extract_flat'] = True  # Don't download, just get info
+            
+            with yt_dlp.YoutubeDL(temp_opts) as ydl:
                 print("Checking video availability...")
-                info = ydl.extract_info(url, download=False)
-                print(f"Video found: {info.get('title', 'Unknown title')}")
-                print(f"Duration: {info.get('duration', 'Unknown')} seconds")
+                try:
+                    info = ydl.extract_info(url, download=False)
+                except Exception:
+                    # If playlist detection fails, fall back to single video
+                    info = None
                 
+                # Check if this is a playlist
+                if info and info.get('_type') == 'playlist':
+                    playlist_title = info.get('title', 'Unknown playlist')
+                    entry_count = len(info.get('entries', []))
+                    print(f"\nPlaylist detected: {playlist_title}")
+                    print(f"Contains {entry_count} videos")
+                    
+                    # Ask user what to do
+                    print("\nOptions:")
+                    print("1. Download only the first video")
+                    print("2. Download entire playlist")
+                    
+                    try:
+                        choice = input("Choose option (1 or 2): ").strip()
+                        if choice == '2':
+                            print(f"\nDownloading entire playlist ({entry_count} videos)...")
+                            ydl_opts['noplaylist'] = False
+                        else:
+                            print("\nDownloading only the first video...")
+                            ydl_opts['noplaylist'] = True
+                    except (KeyboardInterrupt, EOFError):
+                        print("\nDefaulting to single video download...")
+                        ydl_opts['noplaylist'] = True
+                else:
+                    # Single video
+                    if info:
+                        print(f"Video found: {info.get('title', 'Unknown title')}")
+                        if info.get('duration'):
+                            print(f"Duration: {info.get('duration', 'Unknown')} seconds")
+            
+            # Now download with final options
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 print("\nStarting download...")
                 ydl.download([url])
                 
@@ -560,19 +733,36 @@ class YouTubeAudioDownloader:
                     # Retry with advanced cookies
                     ydl_opts_advanced = self._get_base_options(use_fallback_cookies=True)
                     ydl_opts_advanced.update({
-                        'format': 'bestaudio/best',
+                        'format': 'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best[height<=720]/best',
                         'outtmpl': os.path.join(self.settings['download_directory'], '%(title)s.%(ext)s'),
                         'quiet': not self.settings['show_progress'],
                         'no_warnings': not self.settings['show_progress'],
-                        'extractaudio': True,
-                        'audioformat': self.settings['audio_format'],
-                        'audioquality': self.settings['audio_quality'],
-                        'prefer_ffmpeg': True,
-                        'postprocessors': [{
-                            'key': 'FFmpegExtractAudio',
-                            'preferredcodec': self.settings['audio_format'],
-                            'preferredquality': self.settings['audio_quality'],
-                        }],
+                        'writeinfojson': False,
+                        'writethumbnail': False,
+                        'writeautomaticsub': False,
+                        'writesubtitles': False,
+                        'postprocessors': [
+                            {
+                                'key': 'FFmpegExtractAudio',
+                                'preferredcodec': self.settings['audio_format'],
+                                'preferredquality': self.settings['audio_quality'],
+                                'nopostoverwrites': False,
+                            },
+                            {
+                                'key': 'FFmpegMetadata',
+                                'add_metadata': True,
+                            },
+                        ],
+                        'postprocessor_args': {
+                            'FFmpegExtractAudio': [
+                                '-acodec', 'libopus',
+                                '-b:a', self._get_opus_bitrate(),
+                                '-vbr', 'on',
+                                '-compression_level', '10',
+                                '-application', 'audio',
+                            ],
+                        },
+                        'noplaylist': True,
                         'retries': 10,
                         'fragment_retries': 10,
                         'skip_unavailable_fragments': False,
