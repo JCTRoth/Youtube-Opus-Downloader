@@ -32,10 +32,11 @@ Settings (settings.json):
 import sys
 import os
 import json
-import tempfile
-import glob
 import time
 import random
+import tempfile
+import sqlite3
+import shutil
 from pathlib import Path
 import yt_dlp
 
@@ -52,8 +53,7 @@ class YouTubeAudioDownloader:
             settings_file: Path to the settings JSON file
         """
         self.settings = self._load_settings(settings_file)
-        self.cookie_file = None
-        self.using_temp_file = False
+        self._temp_cookie_file = None  # Track temporary cookie files for cleanup
     
     @staticmethod
     def _load_settings(settings_file: str) -> Dict[str, Any]:
@@ -116,50 +116,62 @@ class YouTubeAudioDownloader:
 
     @staticmethod
     def _get_random_user_agent() -> str:
-        """Get a random user agent string to avoid bot detection."""
+        """Get a random modern user agent string to avoid bot detection."""
         user_agents = [
+            # Chrome on Windows
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
             # Chrome on macOS
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            # Firefox on Windows
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
             # Firefox on macOS
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:123.0) Gecko/20100101 Firefox/123.0',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:132.0) Gecko/20100101 Firefox/132.0',
             # Safari on macOS
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Safari/605.1.15'
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15',
+            # Chrome on Linux
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
         ]
         return random.choice(user_agents)
 
-    def _get_base_options(self, cookie_file: Optional[str] = None) -> Dict[str, Any]:
-        """Get base options for yt-dlp.
+    def _get_base_options(self, use_fallback_cookies: bool = False) -> Dict[str, Any]:
+        """Get base options for yt-dlp with modern settings.
         
         Args:
-            cookie_file: Optional path to cookie file
-            
+            use_fallback_cookies: Whether to use fallback cookie methods
+        
         Returns:
             Dictionary of yt-dlp options
         """
         options = {
-            'quiet': True,
-            'no_warnings': True,
-            'nocheckcertificate': True,
-            'http_headers': {
-                'User-Agent': self._get_random_user_agent(),
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'DNT': '1',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'none',
-                'Sec-Fetch-User': '?1'
-            }
+            'quiet': not self.settings.get('show_progress', True),
+            'no_warnings': not self.settings.get('show_progress', True),
         }
         
-        if cookie_file:
-            print(f"\nUsing cookie file: {cookie_file}")
-            options['cookiefile'] = cookie_file
+        # Handle custom cookie file if specified
+        if not self.settings['cookies']['use_browser_cookies'] and self.settings['cookies']['custom_cookies_file']:
+            print(f"\nUsing custom cookie file: {self.settings['cookies']['custom_cookies_file']}")
+            options['cookiefile'] = self.settings['cookies']['custom_cookies_file']
+        elif self.settings['cookies']['use_browser_cookies']:
+            # For Firefox, always use the advanced cookie extraction as primary method
+            # since yt-dlp's built-in cookiesfrombrowser doesn't work reliably with Firefox
+            if self.settings['cookies']['preferred_browser'] == 'firefox' or use_fallback_cookies:
+                # Use advanced cookie extraction as primary method for Firefox
+                advanced_cookie_file = self._get_browser_cookies_fallback()
+                if advanced_cookie_file:
+                    options['cookiefile'] = advanced_cookie_file
+                    self._temp_cookie_file = advanced_cookie_file  # Store for cleanup
+                else:
+                    print("\nAdvanced cookie extraction failed")
+                    # Only fallback to built-in method for non-Firefox browsers
+                    if self.settings['cookies']['preferred_browser'] != 'firefox':
+                        print(f"Falling back to yt-dlp built-in cookie extraction for {self.settings['cookies']['preferred_browser']}")
+                        options['cookiesfrombrowser'] = (self.settings['cookies']['preferred_browser'], None, None, None)
+            else:
+                # Use yt-dlp's built-in browser cookie extraction for Chrome/Edge
+                print(f"\nUsing cookies from browser: {self.settings['cookies']['preferred_browser']}")
+                options['cookiesfrombrowser'] = (self.settings['cookies']['preferred_browser'], None, None, None)
         else:
-            print("\nNo cookie file specified")
+            print("\nNo cookies configured")
         
         return options
 
@@ -231,10 +243,6 @@ class YouTubeAudioDownloader:
             Path to temporary Netscape format cookie file if successful, None otherwise
         """
         try:
-            import sqlite3
-            import tempfile
-            import shutil
-            
             # Create a temporary copy of the SQLite file since it might be locked by Firefox
             temp_sqlite = tempfile.NamedTemporaryFile(delete=False, suffix='.sqlite')
             shutil.copy2(sqlite_file, temp_sqlite.name)
@@ -292,15 +300,58 @@ class YouTubeAudioDownloader:
             print(f"Error converting Firefox cookies: {str(e)}")
             return None
 
-    def _get_browser_cookies(self) -> Optional[str]:
-        """Get cookies from installed browsers.
+    def _save_cookies_to_file(self, cookies) -> Optional[str]:
+        """Save browser cookies to a temporary file in Netscape format.
+        
+        Args:
+            cookies: Cookie object from browser_cookie3
+            
+        Returns:
+            Path to temporary cookie file if successful, None otherwise
+        """
+        cookie_file = tempfile.NamedTemporaryFile(mode='w', delete=False)
+        try:
+            # Write header required by Netscape format
+            cookie_file.write("# Netscape HTTP Cookie File\n")
+            cookie_file.write("# https://curl.haxx.se/rfc/cookie_spec.html\n")
+            cookie_file.write("# This is a generated file!  Do not edit.\n\n")
+            
+            # Convert browser_cookie3 cookies to Netscape format
+            current_time = int(time.time())
+            for cookie in cookies:
+                # Handle missing expiration by setting it to 1 year from now
+                expires = cookie.expires if cookie.expires else current_time + 31536000
+                
+                # Ensure all fields are properly formatted
+                domain = cookie.domain if cookie.domain.startswith('.') else '.' + cookie.domain
+                path = cookie.path if cookie.path else '/'
+                secure = 'TRUE' if cookie.secure else 'FALSE'
+                
+                cookie_file.write(f"{domain}\tTRUE\t{path}\t{secure}\t{expires}\t{cookie.name}\t{cookie.value}\n")
+            
+            cookie_file.close()
+            return cookie_file.name
+        except Exception as e:
+            print(f"Error saving cookies: {str(e)}")
+            try:
+                os.unlink(cookie_file.name)
+            except:
+                pass
+            return None
+
+    def _get_browser_cookies_fallback(self) -> Optional[str]:
+        """Get cookies from installed browsers using browser_cookie3 as fallback.
         
         Returns:
             Path to cookie file if successful, None otherwise
         """
-        import browser_cookie3
+        try:
+            import browser_cookie3
+        except ImportError:
+            print("Warning: browser_cookie3 not installed. Install with: pip install browser-cookie3")
+            return None
         
-        print("\nAttempting to load cookies from browsers...")
+        print("\nUsing advanced cookie extraction method...")
         
         # Define browser order based on preferred browser
         preferred = self.settings['cookies']['preferred_browser']
@@ -369,55 +420,23 @@ class YouTubeAudioDownloader:
                 else:
                     print(f"Error accessing {browser_name} cookies: {str(e)}")
         
-        print("\nWarning: Could not load cookies from any browser.")
+        print("\nWarning: Could not load cookies from any browser using advanced method.")
         print("\nMake sure you have at least one of these browsers installed and are logged into YouTube:")
         print("- Chrome")
         print("- Firefox")
         print("- Edge")
         return None
 
-    def _get_cookies(self) -> Tuple[Optional[str], bool]:
-        """Get cookies based on settings.
-        
-        Returns:
-            Tuple of (cookie_file_path, is_temporary_file)
-        """
-        print("\nCookie configuration:")
-        print(f"- Use browser cookies: {self.settings['cookies']['use_browser_cookies']}")
-        print(f"- Custom cookies file: {self.settings['cookies']['custom_cookies_file']}")
-        
-        # Check if custom cookies file is specified
-        if self.settings['cookies']['custom_cookies_file']:
-            cookie_path = os.path.expanduser(self.settings['cookies']['custom_cookies_file'])
-            print(f"\nChecking custom cookie file path: {cookie_path}")
-            if os.path.exists(cookie_path):
-                print(f"Using custom cookies file: {cookie_path}")
-                return cookie_path, False
-            else:
-                print(f"Warning: Custom cookies file not found at {cookie_path}")
-        
-        # Fall back to browser cookies if enabled
-        if self.settings['cookies']['use_browser_cookies']:
-            print("\nAttempting to load cookies from browsers...")
-            cookie_file = self._get_browser_cookies()
-            if cookie_file:
-                print(f"Using temporary cookie file: {cookie_file}")
-            return cookie_file, bool(cookie_file and cookie_file.startswith(tempfile.gettempdir()))
-        
-        print("\nNo valid cookie source configured. Some videos might be unavailable.")
-        return None, False
-
-    def list_formats(self, url: str, cookie_file: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
+    def list_formats(self, url: str) -> Optional[List[Dict[str, Any]]]:
         """List all available formats for a video.
         
         Args:
             url: YouTube video URL
-            cookie_file: Optional path to cookie file
             
         Returns:
             List of format dictionaries if successful, None otherwise
         """
-        ydl_opts = self._get_base_options(cookie_file)
+        ydl_opts = self._get_base_options()
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
@@ -451,9 +470,11 @@ class YouTubeAudioDownloader:
                 if audio_formats:
                     print("\nAudio-only formats:")
                     for format_id, ext, quality, f in audio_formats:
-                        filesize = f.get('filesize', 'N/A')
-                        if filesize != 'N/A':
+                        filesize = f.get('filesize')
+                        if filesize and isinstance(filesize, (int, float)):
                             filesize = f"{filesize/1024/1024:.1f}MB"
+                        else:
+                            filesize = "N/A"
                         note = f.get('format_note', '')
                         print(f"{format_id:11} {ext:9} {quality:16} {filesize:10} {note}")
                 
@@ -461,9 +482,11 @@ class YouTubeAudioDownloader:
                 if video_formats:
                     print("\nVideo formats (with audio if available):")
                     for format_id, ext, quality, f in video_formats:
-                        filesize = f.get('filesize', 'N/A')
-                        if filesize != 'N/A':
+                        filesize = f.get('filesize')
+                        if filesize and isinstance(filesize, (int, float)):
                             filesize = f"{filesize/1024/1024:.1f}MB"
+                        else:
+                            filesize = "N/A"
                         note = f.get('format_note', '')
                         print(f"{format_id:11} {ext:9} {quality:16} {filesize:10} {note}")
                 
@@ -482,202 +505,117 @@ class YouTubeAudioDownloader:
         if self.settings['create_directory_if_missing']:
             Path(self.settings['download_directory']).mkdir(parents=True, exist_ok=True)
         
-        # Get cookies based on settings
-        self.cookie_file, self.using_temp_file = self._get_cookies()
-        
         try:
             # If --list-formats is specified, just list formats and exit
             if '--list-formats' in sys.argv:
-                self.list_formats(url, self.cookie_file)
+                self.list_formats(url)
                 return
             
             # Get base options and add download-specific options
-            ydl_opts = self._get_base_options(self.cookie_file)
+            ydl_opts = self._get_base_options()
             
-            # First check available formats
+            # Configure for audio extraction
+            ydl_opts.update({
+                'format': 'bestaudio/best',
+                'outtmpl': os.path.join(self.settings['download_directory'], '%(title)s.%(ext)s'),
+                'quiet': not self.settings['show_progress'],
+                'no_warnings': not self.settings['show_progress'],
+                'extractaudio': True,
+                'audioformat': self.settings['audio_format'],
+                'audioquality': self.settings['audio_quality'],
+                'prefer_ffmpeg': True,
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': self.settings['audio_format'],
+                    'preferredquality': self.settings['audio_quality'],
+                }],
+                'retries': 10,
+                'fragment_retries': 10,
+                'skip_unavailable_fragments': False,
+                'ignoreerrors': False,
+                'sleep_interval': 1,  # Add sleep between downloads to be respectful
+                'max_sleep_interval': 5,
+            })
+            
+            # Download and extract audio
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 print("Checking video availability...")
                 info = ydl.extract_info(url, download=False)
                 print(f"Video found: {info.get('title', 'Unknown title')}")
+                print(f"Duration: {info.get('duration', 'Unknown')} seconds")
                 
-                # Check available formats
-                formats = info.get('formats', [])
-                best_format = None
-                best_format_id = None
+                print("\nStarting download...")
+                ydl.download([url])
                 
-                for f in formats:
-                    if f.get('vcodec') == 'none':  # Audio only format
-                        acodec = f.get('acodec', '').lower()
-                        ext = f.get('ext', '').lower()
-                        # Check both codec and extension since some opus streams are in webm containers
-                        if acodec == 'opus' or ext == 'opus':
-                            print(f"Found opus audio format (format_id: {f.get('format_id')}) - perfect match!")
-                            best_format = f
-                            best_format_id = f.get('format_id')
-                            break
-                        elif not best_format and acodec in ['m4a', 'mp4a', 'aac']:
-                            best_format = f
-                            best_format_id = f.get('format_id')
+                print(f"\nDownload completed! File saved in: {self.settings['download_directory']}")
                 
-                if best_format:
-                    if best_format.get('acodec', '').lower() == 'opus' or best_format.get('ext', '').lower() == 'opus':
-                        print("Will download opus directly - no conversion needed")
-                        ydl_opts.update({
-                            'format': best_format_id,
-                            'outtmpl': os.path.join(self.settings['download_directory'], '%(title)s.%(ext)s'),
-                            'quiet': not self.settings['show_progress'],
-                            'retries': 10,
-                            'fragment_retries': 10,
-                            'skip_unavailable_fragments': False,
-                            'ignoreerrors': False
-                        })
-                    else:
-                        print(f"Found audio-only format ({best_format.get('acodec')}) - will convert to opus")
-                        ydl_opts.update({
-                            'format': best_format_id,
-                            'outtmpl': os.path.join(self.settings['download_directory'], '%(title)s.%(ext)s'),
-                            'quiet': not self.settings['show_progress'],
-                            'retries': 10,
-                            'fragment_retries': 10,
-                            'skip_unavailable_fragments': False,
-                            'ignoreerrors': False
-                        })
-                else:
-                    print("No audio-only format available - will extract audio from video")
-                    ydl_opts.update({
+        except yt_dlp.DownloadError as e:
+            error_str = str(e)
+            print(f"\nDownload error: {error_str}")
+            
+            # Try advanced cookie method if the error might be cookie-related
+            if any(keyword in error_str.lower() for keyword in ['cookies', 'login', 'sign in', 'private', 'unavailable']):
+                print("\nAttempting download with advanced cookie extraction...")
+                try:
+                    # Retry with advanced cookies
+                    ydl_opts_advanced = self._get_base_options(use_fallback_cookies=True)
+                    ydl_opts_advanced.update({
                         'format': 'bestaudio/best',
                         'outtmpl': os.path.join(self.settings['download_directory'], '%(title)s.%(ext)s'),
                         'quiet': not self.settings['show_progress'],
+                        'no_warnings': not self.settings['show_progress'],
+                        'extractaudio': True,
+                        'audioformat': self.settings['audio_format'],
+                        'audioquality': self.settings['audio_quality'],
+                        'prefer_ffmpeg': True,
+                        'postprocessors': [{
+                            'key': 'FFmpegExtractAudio',
+                            'preferredcodec': self.settings['audio_format'],
+                            'preferredquality': self.settings['audio_quality'],
+                        }],
                         'retries': 10,
                         'fragment_retries': 10,
                         'skip_unavailable_fragments': False,
-                        'ignoreerrors': False
+                        'ignoreerrors': False,
+                        'sleep_interval': 1,
+                        'max_sleep_interval': 5,
                     })
-            
-            # Now download with the selected format
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                print("\nStarting download...")
-                info = ydl.extract_info(url, download=True)
-                downloaded_file = ydl.prepare_filename(info)
-                
-                # Check if we need to convert - only if it's not already opus audio
-                need_conversion = True
-                
-                # If it's a webm file, check if it contains opus audio
-                if downloaded_file.endswith('.webm'):
-                    import subprocess
-                    try:
-                        # Use ffprobe to check the audio codec
-                        result = subprocess.run([
-                            'ffprobe',
-                            '-v', 'error',
-                            '-select_streams', 'a:0',
-                            '-show_entries', 'stream=codec_name',
-                            '-of', 'default=noprint_wrappers=1:nokey=1',
-                            downloaded_file
-                        ], capture_output=True, text=True, check=True)
-                        
-                        if 'opus' in result.stdout.lower():
-                            print("\nFile is already in opus format, just renaming to .opus extension")
-                            need_conversion = False
-                            # Rename the file to have .opus extension
-                            output_file = os.path.splitext(downloaded_file)[0] + '.opus'
-                            os.rename(downloaded_file, output_file)
-                    except subprocess.CalledProcessError as e:
-                        print(f"Warning: Could not check audio codec: {e.stderr}")
-                        # If we can't check, assume we need to convert
-                        need_conversion = True
-                
-                # If the downloaded file is not already in opus format and needs conversion
-                if not downloaded_file.endswith('.opus') and need_conversion:
-                    output_file = os.path.splitext(downloaded_file)[0] + '.opus'
-                    print(f"\nConverting to opus format...")
-                    import subprocess
                     
-                    try:
-                        # Run ffmpeg with detailed error output
-                        result = subprocess.run([
-                            'ffmpeg',
-                            '-i', downloaded_file,
-                            '-c:a', 'libopus',
-                            '-b:a', '192k',
-                            '-ar', '48000',
-                            '-ac', '2',
-                            '-v', 'warning',
-                            '-y',  # Add -y flag to automatically overwrite
-                            output_file
-                        ], capture_output=True, text=True, check=True)
+                    with yt_dlp.YoutubeDL(ydl_opts_advanced) as ydl:
+                        print("Retrying download with advanced cookies...")
+                        ydl.download([url])
+                        print(f"\nDownload completed with advanced method! File saved in: {self.settings['download_directory']}")
+                        return  # Success with advanced method
                         
-                        # Remove the original file if conversion was successful
-                        os.unlink(downloaded_file)
-                        print("Conversion completed successfully!")
-                        
-                    except subprocess.CalledProcessError as e:
-                        print(f"Error during conversion: {e.stderr}")
-                        if os.path.exists(output_file):
-                            os.unlink(output_file)
-                        raise Exception("Audio conversion failed. See error details above.")
-                    except Exception as e:
-                        print(f"Unexpected error during conversion: {str(e)}")
-                        if os.path.exists(output_file):
-                            os.unlink(output_file)
-                        raise
-                
-                print(f"\nDownload completed! File saved in: {self.settings['download_directory']}")
+                except Exception as advanced_e:
+                    print(f"Advanced method also failed: {str(advanced_e)}")
+            
+            print("This may be due to:")
+            print("- Video unavailable or private")
+            print("- Geographic restrictions")
+            print("- Network connection issues")
+            print("\nTry:")
+            print("1. Check if the video is accessible in your browser")
+            print("2. Update yt-dlp to the latest version")
+            print("3. Try again later")
+            
         except Exception as e:
-            print(f"Error downloading video: {str(e)}")
+            print(f"\nUnexpected error: {str(e)}")
+            print("Please check your settings and try again.")
             if "HTTP Error 403" in str(e):
                 print("\nTip: YouTube blocked the request. Try:")
                 print("1. Waiting a few minutes before trying again")
                 print("2. Using a different browser's cookies")
                 print("3. Opening the video in your browser first")
-            sys.exit(1)
+                
         finally:
-            # Clean up the temporary cookie file only if we created it
-            if self.using_temp_file and self.cookie_file and os.path.exists(self.cookie_file):
+            # Clean up temporary cookie file if created
+            if hasattr(self, '_temp_cookie_file') and self._temp_cookie_file and os.path.exists(self._temp_cookie_file):
                 try:
-                    os.unlink(self.cookie_file)
+                    os.unlink(self._temp_cookie_file)
+                    self._temp_cookie_file = None
                 except:
                     pass
-
-    def _save_cookies_to_file(self, cookies: Any) -> Optional[str]:
-        """Save browser cookies to a temporary file in Netscape format.
-        
-        Args:
-            cookies: Cookie object from browser_cookie3
-            
-        Returns:
-            Path to temporary cookie file if successful, None otherwise
-        """
-        cookie_file = tempfile.NamedTemporaryFile(mode='w', delete=False)
-        try:
-            # Write header required by Netscape format
-            cookie_file.write("# Netscape HTTP Cookie File\n")
-            cookie_file.write("# https://curl.haxx.se/rfc/cookie_spec.html\n")
-            cookie_file.write("# This is a generated file!  Do not edit.\n\n")
-            
-            # Convert browser_cookie3 cookies to Netscape format
-            current_time = int(time.time())
-            for cookie in cookies:
-                # Handle missing expiration by setting it to 1 year from now
-                expires = cookie.expires if cookie.expires else current_time + 31536000
-                
-                # Ensure all fields are properly formatted
-                domain = cookie.domain if cookie.domain.startswith('.') else '.' + cookie.domain
-                path = cookie.path if cookie.path else '/'
-                secure = 'TRUE' if cookie.secure else 'FALSE'
-                
-                cookie_file.write(f"{domain}\tTRUE\t{path}\t{secure}\t{expires}\t{cookie.name}\t{cookie.value}\n")
-            
-            cookie_file.close()
-            return cookie_file.name
-        except Exception as e:
-            print(f"Error saving cookies: {str(e)}")
-            try:
-                os.unlink(cookie_file.name)
-            except:
-                pass
-            return None
 
 def main():
     """Main entry point of the script."""
