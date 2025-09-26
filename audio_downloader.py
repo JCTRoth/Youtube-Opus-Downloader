@@ -171,6 +171,72 @@ class YouTubeAudioDownloader:
         print(f"Warning: Unrecognized audio quality '{quality}'. Using 128k default.")
         return '128k'
 
+    @staticmethod
+    def _clean_youtube_url(url: str) -> str:
+        """Clean up YouTube URL by removing unnecessary parameters.
+        
+        Args:
+            url: Original YouTube URL
+            
+        Returns:
+            Cleaned URL with only essential parameters
+            
+        Examples:
+            https://www.youtube.com/watch?v=P4UTrltQSDI&list=RDP4UTrltQSDI&start_radio=1
+            -> https://www.youtube.com/watch?v=P4UTrltQSDI&list=RDP4UTrltQSDI
+        """
+        try:
+            from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+            
+            # Parse the URL
+            parsed = urlparse(url)
+            
+            # Only process YouTube URLs
+            if 'youtube.com' not in parsed.netloc and 'youtu.be' not in parsed.netloc:
+                return url
+            
+            # Parse query parameters
+            query_params = parse_qs(parsed.query)
+            
+            # Define essential parameters to keep
+            essential_params = {
+                'v',        # Video ID
+                'list',     # Playlist ID
+                't',        # Time parameter
+                'index',    # Playlist index
+                'pp',       # Playlist parameters
+            }
+            
+            # Keep only essential parameters
+            cleaned_params = {}
+            for param, values in query_params.items():
+                if param in essential_params and values:
+                    # Keep only the first value for each parameter
+                    cleaned_params[param] = values[0]
+            
+            # Reconstruct the URL
+            cleaned_query = urlencode(cleaned_params)
+            cleaned_url = urlunparse((
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                parsed.params,
+                cleaned_query,
+                parsed.fragment
+            ))
+            
+            # Log the cleanup if parameters were removed
+            if cleaned_query != parsed.query:
+                removed_params = set(query_params.keys()) - set(cleaned_params.keys())
+                if removed_params:
+                    print(f"Cleaned URL: removed parameters {sorted(removed_params)}")
+            
+            return cleaned_url
+            
+        except Exception as e:
+            print(f"Warning: Could not clean URL, using original: {str(e)}")
+            return url
+
     def _get_base_options(self, use_fallback_cookies: bool = False) -> Dict[str, Any]:
         """Get base options for yt-dlp with modern settings.
         
@@ -474,6 +540,9 @@ class YouTubeAudioDownloader:
         Returns:
             List of format dictionaries if successful, None otherwise
         """
+        # Clean up the URL first
+        url = self._clean_youtube_url(url)
+        
         ydl_opts = self._get_base_options()
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -539,6 +608,12 @@ class YouTubeAudioDownloader:
         Args:
             url: YouTube video URL
         """
+        # Clean up the URL first
+        original_url = url
+        url = self._clean_youtube_url(url)
+        if url != original_url:
+            print(f"Using cleaned URL: {url}")
+        
         # Create download directory if it doesn't exist and setting is enabled
         if self.settings['create_directory_if_missing']:
             Path(self.settings['download_directory']).mkdir(parents=True, exist_ok=True)
