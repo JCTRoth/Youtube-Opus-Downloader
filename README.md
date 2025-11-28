@@ -87,12 +87,12 @@ Example `settings.json`:
 
 Run the script with a YouTube URL:
 ```bash
-python audio_downloader.py "https://www.youtube.com/watch?v=YOUR_VIDEO_ID"
+python3 audio_downloader.py "https://www.youtube.com/watch?v=YOUR_VIDEO_ID"
 ```
 
 To see available formats before downloading:
 ```bash
-python audio_downloader.py --list-formats "https://www.youtube.com/watch?v=YOUR_VIDEO_ID"
+python3 audio_downloader.py --list-formats "https://www.youtube.com/watch?v=YOUR_VIDEO_ID"
 ```
 
 ### Troubleshooting

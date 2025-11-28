@@ -249,6 +249,11 @@ class YouTubeAudioDownloader:
         options = {
             'quiet': not self.settings.get('show_progress', True),
             'no_warnings': not self.settings.get('show_progress', True),
+            # Use a modern desktop user-agent to avoid YouTube forcing limited "tv/ios" clients
+            'http_headers': {
+                'User-Agent': self._get_random_user_agent(),
+                'Referer': 'https://www.youtube.com/'
+            },
         }
         
         # Handle custom cookie file if specified
@@ -545,61 +550,101 @@ class YouTubeAudioDownloader:
         
         ydl_opts = self._get_base_options()
         
+        def _print_formats(formats: List[Dict[str, Any]]) -> None:
+            print("\nAvailable formats:")
+            print("Format Code  Extension  Resolution/Bitrate  Filesize    Note")
+            print("-" * 80)
+
+            audio_formats = []
+            video_formats = []
+
+            for f in formats:
+                format_id = f.get('format_id', 'N/A')
+                ext = f.get('ext', 'N/A')
+
+                # Get resolution or bitrate
+                if f.get('vcodec') == 'none':  # Audio only
+                    quality = f"{f.get('abr', 'N/A')}k"
+                    audio_formats.append((format_id, ext, quality, f))
+                else:  # Video
+                    quality = f.get('resolution', 'N/A')
+                    video_formats.append((format_id, ext, quality, f))
+
+            # Print audio formats first
+            if audio_formats:
+                print("\nAudio-only formats:")
+                for format_id, ext, quality, f in audio_formats:
+                    filesize = f.get('filesize')
+                    if filesize and isinstance(filesize, (int, float)):
+                        filesize = f"{filesize/1024/1024:.1f}MB"
+                    else:
+                        filesize = "N/A"
+                    note = f.get('format_note', '')
+                    print(f"{format_id:11} {ext:9} {quality:16} {filesize:10} {note}")
+
+            # Then print video formats
+            if video_formats:
+                print("\nVideo formats (with audio if available):")
+                for format_id, ext, quality, f in video_formats:
+                    filesize = f.get('filesize')
+                    if filesize and isinstance(filesize, (int, float)):
+                        filesize = f"{filesize/1024/1024:.1f}MB"
+                    else:
+                        filesize = "N/A"
+                    note = f.get('format_note', '')
+                    print(f"{format_id:11} {ext:9} {quality:16} {filesize:10} {note}")
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
                 info = ydl.extract_info(url, download=False)
                 formats = info.get('formats', [])
-                
+
                 if not formats:
                     print("No formats available for this video.")
                     return None
-                
-                print("\nAvailable formats:")
-                print("Format Code  Extension  Resolution/Bitrate  Filesize    Note")
-                print("-" * 80)
-                
-                audio_formats = []
-                video_formats = []
-                
-                for f in formats:
-                    format_id = f.get('format_id', 'N/A')
-                    ext = f.get('ext', 'N/A')
-                    
-                    # Get resolution or bitrate
-                    if f.get('vcodec') == 'none':  # Audio only
-                        quality = f"{f.get('abr', 'N/A')}k"
-                        audio_formats.append((format_id, ext, quality, f))
-                    else:  # Video
-                        quality = f.get('resolution', 'N/A')
-                        video_formats.append((format_id, ext, quality, f))
-                
-                # Print audio formats first
-                if audio_formats:
-                    print("\nAudio-only formats:")
-                    for format_id, ext, quality, f in audio_formats:
-                        filesize = f.get('filesize')
-                        if filesize and isinstance(filesize, (int, float)):
-                            filesize = f"{filesize/1024/1024:.1f}MB"
-                        else:
-                            filesize = "N/A"
-                        note = f.get('format_note', '')
-                        print(f"{format_id:11} {ext:9} {quality:16} {filesize:10} {note}")
-                
-                # Then print video formats
-                if video_formats:
-                    print("\nVideo formats (with audio if available):")
-                    for format_id, ext, quality, f in video_formats:
-                        filesize = f.get('filesize')
-                        if filesize and isinstance(filesize, (int, float)):
-                            filesize = f"{filesize/1024/1024:.1f}MB"
-                        else:
-                            filesize = "N/A"
-                        note = f.get('format_note', '')
-                        print(f"{format_id:11} {ext:9} {quality:16} {filesize:10} {note}")
-                
+
+                # Detect image/storyboard-only responses (mhtml/storyboard) and treat them as failure
+                image_only = all((f.get('ext') == 'mhtml') or (f.get('format_note', '').lower().startswith('storyboard')) for f in formats)
+                if image_only:
+                    raise Exception('Only images are available')
+
+                _print_formats(formats)
                 return formats
             except Exception as e:
-                print(f"Error listing formats: {str(e)}")
+                # If listing formats failed due to YouTube serving only images / SABR client,
+                # retry with a minimal desktop-like request and a generic bestaudio selector.
+                err = str(e)
+                print(f"Error listing formats: {err}")
+
+                if 'Requested format is not available' in err or 'Only images are available' in err or 'Some web client https formats have been skipped' in err:
+                    print("Attempting fallback format listing with a desktop user-agent and generic audio selector...")
+                    fallback_opts = ydl_opts.copy()
+                    # Ensure desktop headers are present
+                    fallback_opts.setdefault('http_headers', {})
+                    fallback_opts['http_headers'].update({
+                        'User-Agent': self._get_random_user_agent(),
+                        'Referer': 'https://www.youtube.com/'
+                    })
+                    # Request generic best audio to surface HLS/m3u8 audio tracks
+                    fallback_opts.update({
+                        'format': 'bestaudio/best',
+                        'socket_timeout': 30,
+                    })
+
+                    # Remove any cookiefile or browser cookie extraction to force an unauthenticated desktop request
+                    fallback_opts.pop('cookiefile', None)
+                    fallback_opts.pop('cookiesfrombrowser', None)
+
+                    try:
+                        with yt_dlp.YoutubeDL(fallback_opts) as fallback_ydl:
+                            info = fallback_ydl.extract_info(url, download=False)
+                            formats = info.get('formats', [])
+                            if formats:
+                                print(f"Fallback found {len(formats)} formats")
+                                return formats
+                    except Exception as e2:
+                        print(f"Fallback listing also failed: {str(e2)}")
+
                 return None
 
     def download(self, url: str) -> None:
@@ -703,7 +748,8 @@ class YouTubeAudioDownloader:
                 format_selector = best_format
             else:
                 # Fallback to format string with preference for opus-compatible sources
-                format_selector = 'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best[height<=720]/best'
+                # Broaden fallback to accept any best audio available (HLS/m3u8, m4a, webm, etc.)
+                format_selector = 'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best'
             
             ydl_opts.update({
                 'format': format_selector,
